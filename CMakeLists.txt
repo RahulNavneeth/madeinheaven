@@ -12,9 +12,9 @@ include_directories(${VENDOR}/raylib/src)
 
 add_subdirectory(${VENDOR}/raylib)
 
-file(GLOB SOURCES
-	${CMAKE_SOURCE_DIR}/src/*.cpp
-)
+# file(GLOB SOURCES
+# 	${CMAKE_SOURCE_DIR}/src/*.cpp
+# )
 
 add_executable(main main.cpp ${SOURCES})
 target_link_libraries(main raylib)

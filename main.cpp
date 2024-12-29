@@ -27,6 +27,7 @@ BoundingBox GetBoundingBox(Vector3 position, float tileSize, float height) {
 enum class SpawnState {
   NONE,
   SPAWN_ATTACKER,
+  SPAWN_WALL,
   SELECTING_PORTAL_START,
   SELECTING_PORTAL_END
 };
@@ -75,6 +76,25 @@ public:
     }
   }
 
+  EntityId CreateWall(Vector3 position, Player owner) {
+    EntityId entity = scene.NewEntity();
+
+    scene.AssignEntity<TransformET>(entity, position);
+    scene.AssignEntity<RenderableET>(
+        entity, owner == Player::PLAYER1 ? DARKGREEN : DARKPURPLE,
+        EntityType::WALL, 2.0f, 2.0f);
+
+    DefenderET defense;
+    defense.defense = 5.0f;
+    defense.blockChance = 0.3f;
+    scene.AssignEntity<DefenderET>(entity, defense);
+
+    scene.AssignEntity<HealthET>(entity, 75.0f);
+    scene.AssignEntity<PlayerET>(entity, owner);
+
+    return entity;
+  }
+
   EntityId CreateAttacker(Vector3 position, Player owner) {
     EntityId entity = scene.NewEntity();
 
@@ -85,7 +105,7 @@ public:
 
     AttackerET attacker;
     attacker.damage = 10.0f;
-    attacker.range = 4.0f;
+    attacker.range = 4.0f * 4;
     attacker.attackCooldown = 1.0f;
     attacker.currentCooldown = 0.0f;
     scene.AssignEntity<AttackerET>(entity, attacker);
@@ -114,6 +134,8 @@ public:
       currentState = SpawnState::SPAWN_ATTACKER;
     if (IsKeyPressed(KEY_TWO))
       currentState = SpawnState::SELECTING_PORTAL_START;
+    if (IsKeyPressed(KEY_THREE))
+      currentState = SpawnState::SPAWN_WALL;
     if (IsKeyPressed(KEY_ESCAPE)) {
       currentState = SpawnState::NONE;
       selectedEntities.clear();
@@ -167,6 +189,12 @@ public:
           selectedEntities.clear();
         }
         break;
+      case SpawnState::SPAWN_WALL:
+        if (points[GetCurrentPlayer()] >= 150) {
+          CreateWall(spawnPos, GetCurrentPlayer());
+          points[GetCurrentPlayer()] -= 150;
+        }
+        break;
 
       default:
         break;
@@ -177,6 +205,7 @@ public:
   Player GetCurrentPlayer() {
     return (cameraAngle < 0) ? Player::PLAYER1 : Player::PLAYER2;
   }
+
   void RenderEntities() {
     for (auto entity : scene.GetAllEntities()) {
       auto transform = scene.GetComponent<TransformET>(entity);
@@ -188,7 +217,7 @@ public:
 
         if (health && health->currentHealth < health->maxHealth) {
           float healthPercent = health->currentHealth / health->maxHealth;
-          color.a = (unsigned char)(255 * healthPercent);
+          color.a = static_cast<unsigned char>(255 * healthPercent);
         }
 
         DrawCube(transform->position, renderable->size, renderable->height,
@@ -196,11 +225,41 @@ public:
         DrawCubeWires(transform->position, renderable->size, renderable->height,
                       renderable->size, BLACK);
 
-        Vector2 screenPos = GetWorldToScreen(transform->position, camera);
-        DrawRectangle(screenPos.x - 20, screenPos.y - 20,
-                      40 * (health->currentHealth / health->maxHealth), 5,
-                      GREEN);
-        DrawRectangleLines(screenPos.x - 20, screenPos.y - 20, 40, 5, RED);
+        if (health) {
+          Vector3 healthBarPos = transform->position;
+          healthBarPos.y += renderable->height;
+
+          float healthPercent = health->currentHealth / health->maxHealth;
+          float barWidth = 4.0f;
+          float barHeight = 0.5f;
+          int numSegments = 10;
+
+          for (int i = 0; i < numSegments; i++) {
+            float segmentWidth = barWidth / numSegments;
+            DrawCube({healthBarPos.x - barWidth / 2 + i * segmentWidth,
+                      healthBarPos.y, healthBarPos.z},
+                     segmentWidth, barHeight, 0.1f, RED);
+          }
+
+          int filledSegments = static_cast<int>(numSegments * healthPercent);
+          for (int i = 0; i < filledSegments; i++) {
+            float segmentWidth = barWidth / numSegments;
+            DrawCube({healthBarPos.x - barWidth / 2 + i * segmentWidth,
+                      healthBarPos.y, healthBarPos.z},
+                     segmentWidth, barHeight, 0.1f, GREEN);
+          }
+
+          std::string healthText =
+              std::to_string(static_cast<int>(health->currentHealth)) + "/" +
+              std::to_string(static_cast<int>(health->maxHealth));
+
+          Vector2 screenPos = GetWorldToScreen(healthBarPos, camera);
+
+          if (screenPos.x > 0 && screenPos.y > 0) {
+            DrawText(healthText.c_str(), static_cast<int>(screenPos.x) - 20,
+                     static_cast<int>(screenPos.y) - 10, 20, BLACK);
+          }
+        }
       }
     }
   }
@@ -376,6 +435,7 @@ public:
         }
 
         if (!scene.GetComponent<AttackerET>(targetEntity) &&
+            !scene.GetComponent<DefenderET>(targetEntity) &&
             targetEntity != player1Reactor && targetEntity != player2Reactor) {
           continue;
         }
@@ -391,12 +451,19 @@ public:
       if (nearestTarget != -1) {
         auto targetTransform = scene.GetComponent<TransformET>(nearestTarget);
         auto targetHealth = scene.GetComponent<HealthET>(nearestTarget);
+        auto targetDefense = scene.GetComponent<DefenderET>(nearestTarget);
 
         float distance =
             Vector3Distance(transform->position, targetTransform->position);
 
         if (distance <= attacker->range && attacker->CanAttack()) {
-          targetHealth->TakeDamage(attacker->damage);
+          float finalDamage = attacker->damage;
+          if (targetDefense) {
+            finalDamage =
+                targetDefense->CalculateDamageReduction(attacker->damage);
+          }
+
+          targetHealth->TakeDamage(finalDamage);
           attacker->Attack();
 
           Color particleColor;
@@ -411,11 +478,19 @@ public:
           startPos.y += 1.0f;
           endPos.y += 1.0f;
 
-          particleSystem.AddParticle<AttackParticle>(startPos, endPos,
-                                                     particleColor, 4.0f);
+          float damageReductionFactor = finalDamage / attacker->damage;
+          Color modifiedParticleColor = {
+              static_cast<unsigned char>(particleColor.r *
+                                         damageReductionFactor),
+              static_cast<unsigned char>(particleColor.g *
+                                         damageReductionFactor),
+              particleColor.b, particleColor.a};
+
+          particleSystem.AddParticle<AttackParticle>(
+              startPos, endPos, modifiedParticleColor, 4.0f);
 
           if (!targetHealth->IsAlive()) {
-            points[playerComp->player] += 50;
+            points[playerComp->player] += finalDamage > 0 ? 50 : 25;
           }
         }
       }
@@ -482,6 +557,15 @@ public:
 
     RenderEntities();
 
+    particleSystem.Draw();
+
+    if (currentState == SpawnState::SELECTING_PORTAL_END &&
+        !selectedEntities.empty()) {
+      DrawLine3D(portalStartPos,
+                 closestCollision.hit ? closestCollision.point : ray.position,
+                 GetCurrentPlayer() == Player::PLAYER1 ? BLUE : RED);
+    }
+
     EndMode3D();
     RenderUI();
     EndDrawing();
@@ -528,8 +612,11 @@ public:
     case SpawnState::SELECTING_PORTAL_END:
       stateText = "Select Portal End Position - ESC to cancel";
       break;
+    case SpawnState::SPAWN_WALL:
+      stateText = "Wall Spawn Mode (Cost: 150) - ESC to cancel";
+      break;
     default:
-      stateText = "Press 1 for Attacker, 2 for Portal";
+      stateText = "Press 1 for Attacker, 2 for Portal, 3 for Wall";
       break;
     }
     DrawText(stateText, 10, 70, 20, DARKGRAY);
@@ -566,7 +653,6 @@ public:
 
 int main() {
   Game game;
-
   while (!WindowShouldClose()) {
     game.Update();
     game.Render();
